@@ -1,4 +1,3 @@
-
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -404,9 +403,12 @@ int main(int argc, char **argv) {
 
 #ifndef NO_PTHREAD
     thread_n = sysconf(_SC_NPROCESSORS_ONLN);
-    thread_n = thread_n/2;
-    if(thread_n < 1) thread_n = 1;
-    fprintf(stderr, "use %ld thread(s)\n", thread_n);
+    if (xcorr.xsearch > 512 || xcorr.ysearch >1024)
+        thread_n = thread_n/3;
+    else
+        thread_n = thread_n*3/4;
+    if (thread_n <1) thread_n = 1;
+    fprintf(stderr, "XCORR使用 %ld 個線程！\n", thread_n);
 #endif
     do_correlation(&xcorr, thread_n);
 
