@@ -1,7 +1,17 @@
 CC = gcc
 CXX = g++
 INCLUDE = -I. `pkg-config --cflags glib-2.0 fftw3`
-override CFLAGS := $(CFLAGS) $(INCLUDE) -std=gnu99
+ifeq (,$(findstring -fopenmp,$(CFLAGS)))
+OPENMP_CFLAGS ?= -fopenmp
+else
+OPENMP_CFLAGS ?=
+endif
+ifeq (,$(findstring -fopenmp,$(CFLAGS)))
+OPENMP_LDFLAGS ?= -fopenmp
+else
+OPENMP_LDFLAGS ?=
+endif
+override CFLAGS := $(CFLAGS) $(INCLUDE) -std=gnu99 $(OPENMP_CFLAGS)
 override CXXFLAGS := $(CXXFLAGS) $(INCLUDE) -std=c++11
 
 all: xcorr2 # xcorr2_cl
@@ -20,10 +30,10 @@ xcorr2_args.o: xcorr2_args.c
 	$(CC) -c -o $@ $^ $(CFLAGS)
 
 xcorr2: xcorr2.c array_helper.o fft_helper.o prm_helper.o xcorr2_args.o
-	$(CC) -o $@ $^ $(CFLAGS) -lm `pkg-config --libs glib-2.0 fftw3`
+	$(CC) -o $@ $^ $(CFLAGS) $(OPENMP_LDFLAGS) -lm `pkg-config --libs glib-2.0 fftw3`
 
 xcorr2_sg: xcorr2.c array_helper.o fft_helper.o prm_helper.o xcorr2_args.o
-	$(CC) -o $@ $^ $(CFLAGS) -lm `pkg-config --libs glib-2.0 fftw3` -DNO_PTHREAD
+	$(CC) -o $@ $^ $(CFLAGS) $(OPENMP_LDFLAGS) -lm `pkg-config --libs glib-2.0 fftw3` -DNO_PTHREAD
 
 #xcorr2_cl: xcorr2_cl.cpp xcorr2_args.o prm_helper.o
 #	$(CXX) -o $@ $^ $(CXXFLAGS) -laf `pkg-config --libs glib-2.0`

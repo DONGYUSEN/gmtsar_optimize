@@ -11,6 +11,9 @@
 #include <glib.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <sys/types.h>
+#include <stdint.h>
+#include <errno.h>
 
 #include "xcorr2.h"
 #include "xcorr2_args.h"
@@ -22,7 +25,187 @@ struct st_corr_thread_data {
     double xoff, yoff;
     int loc_x, loc_y;
     double corr;
+    volatile gint done;
 };
+
+static unsigned long long detect_available_memory_bytes(void) {
+    FILE *f;
+    char line[256];
+    unsigned long long kb;
+    long pages, page_size;
+
+    f = fopen("/proc/meminfo", "r");
+    if (f != NULL) {
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                fclose(f);
+                return kb * 1024ULL;
+            }
+        }
+        fclose(f);
+    }
+
+#ifdef _SC_AVPHYS_PAGES
+    pages = sysconf(_SC_AVPHYS_PAGES);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0)
+        return (unsigned long long)pages * (unsigned long long)page_size;
+#endif
+
+    pages = sysconf(_SC_PHYS_PAGES);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0)
+        return ((unsigned long long)pages * (unsigned long long)page_size) / 2ULL;
+
+    return 0;
+}
+
+static unsigned long long estimate_worker_peak_memory_bytes(const struct st_xcorr *xc) {
+    unsigned long long nx_corr, ny_corr, nx_win, ny_win;
+    unsigned long long p, fft_cells, corr_cells;
+    unsigned long long bytes_window, bytes_interp_peak, bytes_freq_peak;
+    unsigned long long ri;
+
+    nx_corr = (unsigned long long)xc->xsearch * 2ULL;
+    ny_corr = (unsigned long long)xc->ysearch * 2ULL;
+    nx_win = nx_corr * 2ULL;
+    ny_win = ny_corr * 2ULL;
+    p = nx_win * ny_win;
+    fft_cells = ny_win * (nx_win/2ULL + 1ULL);
+    corr_cells = nx_corr * ny_corr;
+    ri = (xc->ri > 1) ? (unsigned long long)xc->ri : 1ULL;
+
+    bytes_window = 2ULL * p * sizeof(complex double);  // c1 + c2
+
+    if (xc->ri > 1) {
+        // peak while computing interp2 while interp1 is still alive:
+        // c1 + c2 + interp1 + (in_fft + out_fft + out_for_interp2)
+        bytes_interp_peak =
+            bytes_window +
+            (p * ri) * sizeof(complex double) +
+            (p + 2ULL * p * ri) * sizeof(complex double);
+    } else {
+        bytes_interp_peak = bytes_window;
+    }
+
+    // peak around frequency correlation:
+    // c1r + c2r + c1r_fft + c2r_fft + c3r + corr_slice
+    bytes_freq_peak =
+        2ULL * p * sizeof(double) +
+        2ULL * fft_cells * sizeof(complex double) +
+        p * sizeof(double) +
+        corr_cells * sizeof(double);
+
+    return (bytes_interp_peak > bytes_freq_peak) ? bytes_interp_peak : bytes_freq_peak;
+}
+
+static long auto_tune_threads(const struct st_xcorr *xc, long cpu_target_threads) {
+    unsigned long long avail_bytes, worker_peak, usable_bytes;
+    unsigned long long queued_window_bytes, per_thread_effective;
+    double window_scale, safety_factor;
+    long by_memory;
+    long tuned;
+
+    tuned = cpu_target_threads;
+    if (tuned < 1) tuned = 1;
+
+    avail_bytes = detect_available_memory_bytes();
+    worker_peak = estimate_worker_peak_memory_bytes(xc);
+
+    // queue_limit is 1, so one extra queued task may hold c1+c2 windows.
+    queued_window_bytes =
+        2ULL * (unsigned long long)(xc->xsearch * 4ULL) *
+        (unsigned long long)(xc->ysearch * 4ULL) * sizeof(complex double);
+
+    // Dynamic safety factor:
+    // keep a margin for FFTW/allocator overhead while avoiding excessive throttling.
+    window_scale = ((double)xc->xsearch * (double)xc->ysearch) / (256.0 * 256.0);
+    if (window_scale < 1.0) window_scale = 1.0;
+    safety_factor = 1.4 + 0.6 * sqrt(window_scale);
+
+    per_thread_effective =
+        (unsigned long long)((long double)worker_peak * safety_factor) + queued_window_bytes;
+    if (avail_bytes == 0 || per_thread_effective == 0)
+        return tuned;
+
+    // keep some free headroom for OS/page cache and neighboring processes.
+    usable_bytes = (unsigned long long)((long double)avail_bytes * 0.85L);
+    by_memory = (long)(usable_bytes / per_thread_effective);
+    if (by_memory < 1) {
+        fprintf(stderr,
+                "Estimated memory is insufficient for one worker (need about %.2f GB per worker). "
+                "Reduce xsearch/ysearch or use -norange/-nointerp.\n",
+                per_thread_effective / (1024.0 * 1024.0 * 1024.0));
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(stderr,
+            "Auto thread caps: cpu=%ld, memory=%ld (avail %.2f GB, est %.2f GB/thread, safety %.2f)\n",
+            tuned, by_memory,
+            avail_bytes / (1024.0 * 1024.0 * 1024.0),
+            per_thread_effective / (1024.0 * 1024.0 * 1024.0),
+            safety_factor);
+
+    if (by_memory < tuned) {
+        fprintf(stderr,
+                "Auto-tuning threads: CPU cap=%ld, memory cap=%ld, using %ld.\n",
+                tuned, by_memory, by_memory);
+        tuned = by_memory;
+    }
+
+    return tuned;
+}
+
+static void compute_axis_positions(
+        int *out, int n,
+        int half_win,
+        int master_len, int slave_len,
+        double scale, double offset,
+        const char *axis_name) {
+    double lower, upper;
+    double s_lower, s_upper;
+
+    if (n < 1) {
+        fprintf(stderr, "Invalid %s sample count: %d\n", axis_name, n);
+        exit(EXIT_FAILURE);
+    }
+
+    if (scale <= 0.0) {
+        fprintf(stderr, "Invalid %s scale factor: %.6f\n", axis_name, scale);
+        exit(EXIT_FAILURE);
+    }
+
+    lower = half_win;
+    upper = master_len - half_win;
+
+    s_lower = (half_win - offset) / scale;
+    s_upper = (slave_len - half_win - offset) / scale;
+    if (s_lower > s_upper) {
+        double t = s_lower;
+        s_lower = s_upper;
+        s_upper = t;
+    }
+
+    if (s_lower > lower) lower = s_lower;
+    if (s_upper < upper) upper = s_upper;
+
+    if (lower > upper) {
+        fprintf(stderr,
+                "No feasible %s window centers. "
+                "Adjust search window / shift / stretch parameters.\n",
+                axis_name);
+        exit(EXIT_FAILURE);
+    }
+
+    if (n == 1) {
+        out[0] = (int)llround((lower + upper) / 2.0);
+        return;
+    }
+
+    double step = (upper - lower) / (n - 1);
+    for (int i=0; i<n; i++)
+        out[i] = (int)llround(lower + i * step);
+}
 
 complex double *load_slc_rows(FILE *fin, int start, int n_rows, int nx) {
     long offset;
@@ -33,7 +216,11 @@ complex double *load_slc_rows(FILE *fin, int start, int n_rows, int nx) {
     fseek(fin, offset, SEEK_SET);
 
     tmp = malloc(nx * sizeof(short) * 2);
-    arr = fftw_alloc_complex(n_rows * nx);
+    arr = fftw_alloc_complex((size_t)n_rows * nx);
+    if (tmp == NULL || arr == NULL) {
+        perror("Failed to allocate memory for SLC rows");
+        exit(-1);
+    }
 
     for (int i=0; i<n_rows; i++) {
         if (fread(tmp, 2*sizeof(short), nx, fin) != (unsigned long)nx) {
@@ -43,6 +230,42 @@ complex double *load_slc_rows(FILE *fin, int start, int n_rows, int nx) {
 
         for (int j=0; j<nx; j++)
             arr[i*nx + j] = tmp[2*j] + tmp[2*j+1] * I;
+    }
+
+    free(tmp);
+    return arr;
+}
+
+complex double *load_slc_window(
+        FILE *fin,
+        int start_row, int n_rows, int total_nx,
+        int start_col, int n_cols) {
+    short *tmp;
+    complex double *arr;
+
+    tmp = malloc((size_t)n_cols * sizeof(short) * 2);
+    arr = fftw_alloc_complex((size_t)n_rows * n_cols);
+    if (tmp == NULL || arr == NULL) {
+        perror("Failed to allocate memory for SLC window");
+        exit(-1);
+    }
+
+    for (int i=0; i<n_rows; i++) {
+        long long sample_offset = (long long)(start_row + i) * total_nx + start_col;
+        off_t byte_offset = (off_t)(sample_offset * (long long)(sizeof(short) * 2));
+
+        if (fseeko(fin, byte_offset, SEEK_SET) != 0) {
+            perror("Failed to seek SLC file");
+            exit(-1);
+        }
+
+        if (fread(tmp, 2*sizeof(short), n_cols, fin) != (size_t)n_cols) {
+            perror("Failed to read data from SLC file");
+            exit(-1);
+        }
+
+        for (int j=0; j<n_cols; j++)
+            arr[i*n_cols + j] = tmp[2*j] + tmp[2*j+1] * I;
     }
 
     free(tmp);
@@ -96,13 +319,22 @@ double *freq_corr(
     fftw_plan plan1, plan2, plan3;
 
     if (fftw_lock) pthread_mutex_lock(fftw_lock);
-    c1r_fft = fftw_alloc_complex(ny_win * (nx_win/2+1));
-    c2r_fft = fftw_alloc_complex(ny_win * (nx_win/2+1));
-    c3r = fftw_alloc_real(nx_win * ny_win);
+    c1r_fft = fftw_alloc_complex((size_t)ny_win * (nx_win/2+1));
+    c2r_fft = fftw_alloc_complex((size_t)ny_win * (nx_win/2+1));
+    c3r = fftw_alloc_real((size_t)nx_win * ny_win);
+    if (c1r_fft == NULL || c2r_fft == NULL || c3r == NULL) {
+        perror("Failed to allocate memory for FFT correlation");
+        exit(-1);
+    }
 
     plan1 = fftw_plan_dft_r2c_2d(ny_win, nx_win, c1r, c1r_fft, FFTW_ESTIMATE);
     plan2 = fftw_plan_dft_r2c_2d(ny_win, nx_win, c2r, c2r_fft, FFTW_ESTIMATE);
     plan3 = fftw_plan_dft_c2r_2d(ny_win, nx_win, c1r_fft, c3r, FFTW_ESTIMATE);
+    if (plan1 == NULL || plan2 == NULL || plan3 == NULL) {
+        if (fftw_lock) pthread_mutex_unlock(fftw_lock);
+        fprintf(stderr, "Failed to create FFTW plans for freq_corr\n");
+        exit(EXIT_FAILURE);
+    }
     if (fftw_lock) pthread_mutex_unlock(fftw_lock);
 
     fftw_execute(plan1);
@@ -175,8 +407,12 @@ void corr_thread(gpointer arg, gpointer user_data) {
         if (lock) pthread_mutex_unlock(lock);
     }
 
-    c1r = fftw_alloc_real(nx_win * ny_win);
-    c2r = fftw_alloc_real(nx_win * ny_win);
+    c1r = fftw_alloc_real((size_t)nx_win * ny_win);
+    c2r = fftw_alloc_real((size_t)nx_win * ny_win);
+    if (c1r == NULL || c2r == NULL) {
+        perror("Failed to allocate memory for amplitude buffers");
+        exit(-1);
+    }
 
     double mean1 = 0.0, mean2 = 0.0;
     for (int k=0; k<nx_win*ny_win; k++) {
@@ -301,17 +537,21 @@ void corr_thread(gpointer arg, gpointer user_data) {
     fftw_free(c3r);
     fftw_free(corr);
     if (lock) pthread_mutex_unlock(lock);
+
+    g_atomic_int_set(&data->done, 1);
 }
 
 void do_correlation(struct st_xcorr *xc, long thread_n) {
-    int loc_n, loc_x, loc_y;
+    int loc_x, loc_y;
     int slave_loc_x, slave_loc_y;
-    int x_inc, y_inc;
     int nx_win, ny_win;
     int nx_corr, ny_corr;
-    complex double *m_rows, *s_rows;
     complex double *c1, *c2;
     FILE *fmaster, *fslave;
+    FILE *fout;
+    struct st_corr_thread_data *row_tasks;
+    int *loc_x_list, *loc_y_list;
+    double scale = 1.0 + xc->astretcha;
 
     if ((fmaster = fopen(xc->m_path, "rb")) == NULL) {
         perror("failed to open master SLC image");
@@ -323,49 +563,84 @@ void do_correlation(struct st_xcorr *xc, long thread_n) {
         exit(-1);
     }
 
+    if ((fout = fopen("freq_xcorr.dat", "w")) == NULL) {
+        perror("failed to open output file");
+        exit(-1);
+    }
+
     nx_corr = xc->xsearch * 2;
     nx_win = nx_corr * 2;
     ny_corr = xc->ysearch * 2;
     ny_win = ny_corr * 2;
 
-    x_inc = (xc->m_nx - 2*(xc->xsearch + nx_corr)) / (xc->nxl + 3);
-    y_inc = (xc->m_ny - 2*(xc->ysearch + ny_corr)) / (xc->nyl + 1);
+    loc_x_list = malloc((size_t)xc->nxl * sizeof(*loc_x_list));
+    loc_y_list = malloc((size_t)xc->nyl * sizeof(*loc_y_list));
+    if (loc_x_list == NULL || loc_y_list == NULL) {
+        perror("failed to allocate location arrays");
+        exit(-1);
+    }
 
-    loc_n = loc_x = loc_y = 0;
-    struct st_corr_thread_data thread_data[xc->nyl * xc->nxl];
-    memset(thread_data, 0, sizeof(thread_data));
+    compute_axis_positions(
+            loc_x_list, xc->nxl,
+            nx_win/2,
+            xc->m_nx, xc->s_nx,
+            scale, xc->x_offset, "x");
+    compute_axis_positions(
+            loc_y_list, xc->nyl,
+            ny_win/2,
+            xc->m_ny, xc->s_ny,
+            scale, xc->y_offset, "y");
+
+    row_tasks = calloc((size_t)xc->nxl, sizeof(*row_tasks));
+    if (row_tasks == NULL) {
+        perror("failed to allocate task buffers");
+        exit(-1);
+    }
 
 #ifndef NO_PTHREAD
     GThreadPool *thread_pool;
     pthread_mutex_t fftw_lock;
+    guint queue_limit;
 
     thread_pool = g_thread_pool_new(corr_thread, &fftw_lock, thread_n, TRUE, NULL);
     pthread_mutex_init(&fftw_lock, NULL);
+    queue_limit = 1U;
 #endif
 
-    for (int j=1; j<=xc->nyl; j++) {
-        loc_y = ny_win + j * y_inc;
+    for (int jy=0; jy<xc->nyl; jy++) {
+        int row_n = 0;
+
+        loc_y = loc_y_list[jy];
         slave_loc_y = (1+xc->astretcha)*loc_y + xc->y_offset;
 
-        m_rows = load_slc_rows(fmaster, loc_y-ny_win/2, ny_win, xc->m_nx);
-        s_rows = load_slc_rows(fslave, slave_loc_y-ny_win/2, ny_win, xc->s_nx);
-
-        for (int i=2; i<=xc->nxl+1; i++) {
-            loc_x = nx_win + i * x_inc;
+        for (int ix=0; ix<xc->nxl; ix++) {
+            loc_x = loc_x_list[ix];
             slave_loc_x = (1+xc->astretcha)*loc_x + xc->x_offset;
 
             //fprintf(stderr, "LOC#%d (%d, %d) <=> (%d, %d)\n", loc_n, loc_x, loc_y, slave_loc_x, slave_loc_y);
 
-            c1 = c64_array_slice(m_rows, xc->m_nx, 0, ny_win, loc_x-nx_win/2, nx_win);
-            c2 = c64_array_slice(s_rows, xc->s_nx, 0, ny_win, slave_loc_x-nx_win/2, nx_win);
+#ifndef NO_PTHREAD
+            while (g_thread_pool_unprocessed(thread_pool) >= queue_limit)
+                g_usleep(1000);
+#endif
+
+            c1 = load_slc_window(
+                    fmaster,
+                    loc_y - ny_win/2, ny_win, xc->m_nx,
+                    loc_x - nx_win/2, nx_win);
+            c2 = load_slc_window(
+                    fslave,
+                    slave_loc_y - ny_win/2, ny_win, xc->s_nx,
+                    slave_loc_x - nx_win/2, nx_win);
  
-            struct st_corr_thread_data *p = &thread_data[loc_n++];
+            struct st_corr_thread_data *p = &row_tasks[row_n++];
             *p = (struct st_corr_thread_data) {
                 .xc = xc,
                 .c1 = c1,
                 .c2 = c2,
                 .loc_x = loc_x,
-                .loc_y = loc_y
+                .loc_y = loc_y,
+                .done = 0
             };
 
 #ifndef NO_PTHREAD
@@ -375,8 +650,17 @@ void do_correlation(struct st_xcorr *xc, long thread_n) {
 #endif
         }
 
-        fftw_free(m_rows);
-        fftw_free(s_rows);
+#ifndef NO_PTHREAD
+        for (int i=0; i<row_n; i++)
+            while (!g_atomic_int_get(&row_tasks[i].done))
+                g_usleep(1000);
+#endif
+
+        for (int i=0; i<row_n; i++) {
+            struct st_corr_thread_data *p = row_tasks + i;
+            fprintf(fout, " %d %6.3f %d %6.3f %6.2f \n",
+                    p->loc_x, p->xoff, p->loc_y, p->yoff, p->corr);
+        }
     }
 
 #ifndef NO_PTHREAD
@@ -385,12 +669,11 @@ void do_correlation(struct st_xcorr *xc, long thread_n) {
 #endif
     fftw_cleanup();
 
-    FILE *fout = fopen("freq_xcorr.dat", "w");
-    for (int i=0; i<loc_n; i++) {
-        struct st_corr_thread_data *p = thread_data + i;
-        fprintf(fout, " %d %6.3f %d %6.3f %6.2f \n",
-                p->loc_x, p->xoff, p->loc_y, p->yoff, p->corr);
-    }
+    free(row_tasks);
+    free(loc_x_list);
+    free(loc_y_list);
+    fclose(fmaster);
+    fclose(fslave);
     fclose(fout);
 }
 
@@ -403,9 +686,13 @@ int main(int argc, char **argv) {
     apply_args(&args, &xcorr);
 
 #ifndef NO_PTHREAD
-    thread_n = sysconf(_SC_NPROCESSORS_ONLN);
-    thread_n = thread_n/2;
+    long cpu_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_threads < 1) cpu_threads = 1;
+    thread_n = cpu_threads * 3 / 4;
     if(thread_n < 1) thread_n = 1;
+
+    thread_n = auto_tune_threads(&xcorr, thread_n);
+
     fprintf(stderr, "use %ld thread(s)\n", thread_n);
 #endif
     do_correlation(&xcorr, thread_n);

@@ -1,6 +1,8 @@
 #include "xcorr2.h"
 #include <assert.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <fftw3.h>
 
 complex double *dft_interpolate_2d(
@@ -26,8 +28,19 @@ complex double *dft_interpolate_2d(
     in_fft = fftw_alloc_complex(height * width);
     out_fft = fftw_alloc_complex(out_height * out_width);
     out = fftw_alloc_complex(out_height * out_width);
+    if (in_fft == NULL || out_fft == NULL || out == NULL) {
+        if (fftw_lock) pthread_mutex_unlock(fftw_lock);
+        perror("Failed to allocate memory for dft_interpolate_2d");
+        exit(EXIT_FAILURE);
+    }
+
     plan1 = fftw_plan_dft_2d(height, width, in, in_fft, FFTW_FORWARD, FFTW_ESTIMATE);
     plan2 = fftw_plan_dft_2d(out_height, out_width, out_fft, out, FFTW_BACKWARD, FFTW_ESTIMATE);
+    if (plan1 == NULL || plan2 == NULL) {
+        if (fftw_lock) pthread_mutex_unlock(fftw_lock);
+        fprintf(stderr, "Failed to create FFTW plans for dft_interpolate_2d\n");
+        exit(EXIT_FAILURE);
+    }
     if (fftw_lock) pthread_mutex_unlock(fftw_lock);
 
     fftw_execute(plan1);
@@ -97,8 +110,19 @@ double *rdft_interpolate_2d(
     in_fft = fftw_alloc_complex(height * (width/2 + 1));
     out_fft = fftw_alloc_complex(out_height * (out_width/2 + 1));
     out = fftw_alloc_real(out_height * out_width);
+    if (in_fft == NULL || out_fft == NULL || out == NULL) {
+        if (fftw_lock) pthread_mutex_unlock(fftw_lock);
+        perror("Failed to allocate memory for rdft_interpolate_2d");
+        exit(EXIT_FAILURE);
+    }
+
     plan1 = fftw_plan_dft_r2c_2d(height, width, in, in_fft, FFTW_ESTIMATE);
     plan2 = fftw_plan_dft_c2r_2d(out_height, out_width, out_fft, out, FFTW_ESTIMATE);
+    if (plan1 == NULL || plan2 == NULL) {
+        if (fftw_lock) pthread_mutex_unlock(fftw_lock);
+        fprintf(stderr, "Failed to create FFTW plans for rdft_interpolate_2d\n");
+        exit(EXIT_FAILURE);
+    }
     if (fftw_lock) pthread_mutex_unlock(fftw_lock);
 
     fftw_execute(plan1);

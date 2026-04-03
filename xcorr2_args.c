@@ -6,6 +6,108 @@
 #include <string.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+
+static void die_arg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    exit(EXIT_FAILURE);
+}
+
+static int parse_int_opt(const char *name, const char *value) {
+    char *endptr = NULL;
+    long parsed;
+
+    if (value == NULL || *value == '\0') {
+        fprintf(stderr, "Option --%s requires an integer value\n", name);
+        exit(EXIT_FAILURE);
+    }
+
+    errno = 0;
+    parsed = strtol(value, &endptr, 10);
+    if (errno != 0 || endptr == value || *endptr != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+        fprintf(stderr, "Invalid integer for --%s: %s\n", name, value);
+        exit(EXIT_FAILURE);
+    }
+
+    return (int)parsed;
+}
+
+static const char *require_prm_value(struct prm_handler prm, const char *key, const char *prm_path) {
+    const char *value = prm_get_str(prm, key);
+    if (value == NULL) {
+        fprintf(stderr, "Missing key '%s' in PRM file %s\n", key, prm_path);
+        exit(EXIT_FAILURE);
+    }
+
+    return value;
+}
+
+static void validate_xcorr_config(const struct st_xcorr *xc) {
+    int nx_corr, ny_corr;
+    int nx_win, ny_win;
+    double scale;
+    double x_lower, x_upper, y_lower, y_upper;
+    double sx1, sx2, sy1, sy2;
+
+    if (xc->m_nx <= 0 || xc->m_ny <= 0 || xc->s_nx <= 0 || xc->s_ny <= 0)
+        die_arg("Invalid image dimensions from PRM");
+
+    if (xc->nxl < 1 || xc->nyl < 1)
+        die_arg("Options --nx/--ny must be positive");
+
+    if (xc->xsearch < 2 || !TEST_2PWR(xc->xsearch))
+        die_arg("Option --xsearch must be a power of two and >= 2");
+    if (xc->xsearch > 2048)
+        die_arg("Option --xsearch must be <= 2048");
+
+    if (xc->ysearch < 2 || !TEST_2PWR(xc->ysearch))
+        die_arg("Option --ysearch must be a power of two and >= 2");
+    if (xc->ysearch > 2048)
+        die_arg("Option --ysearch must be <= 2048");
+
+    if (xc->ri < 1)
+        die_arg("Option --range_interp must be >= 1");
+
+    if (xc->interp_factor < 1)
+        die_arg("Option --interp must be >= 1");
+
+    nx_corr = xc->xsearch * 2;
+    ny_corr = xc->ysearch * 2;
+    nx_win = nx_corr * 2;
+    ny_win = ny_corr * 2;
+    scale = 1.0 + xc->astretcha;
+    if (scale <= 0.0)
+        die_arg("Invalid PRF stretch: (1 + astretcha) must be > 0");
+
+    x_lower = nx_win / 2.0;
+    x_upper = xc->m_nx - nx_win / 2.0;
+    y_lower = ny_win / 2.0;
+    y_upper = xc->m_ny - ny_win / 2.0;
+
+    sx1 = (nx_win / 2.0 - xc->x_offset) / scale;
+    sx2 = (xc->s_nx - nx_win / 2.0 - xc->x_offset) / scale;
+    if (sx1 > sx2) {
+        double t = sx1;
+        sx1 = sx2;
+        sx2 = t;
+    }
+    if (sx1 > x_lower) x_lower = sx1;
+    if (sx2 < x_upper) x_upper = sx2;
+
+    sy1 = (ny_win / 2.0 - xc->y_offset) / scale;
+    sy2 = (xc->s_ny - ny_win / 2.0 - xc->y_offset) / scale;
+    if (sy1 > sy2) {
+        double t = sy1;
+        sy1 = sy2;
+        sy2 = t;
+    }
+    if (sy1 > y_lower) y_lower = sy1;
+    if (sy2 < y_upper) y_upper = sy2;
+
+    if (x_lower > x_upper || y_lower > y_upper)
+        die_arg("No feasible window centers for current search/shift/stretch settings");
+}
 
 void strtrim(char *s) {
     char *p = s;
@@ -27,6 +129,23 @@ void apply_args(const struct st_xcorr_args *args, struct st_xcorr *xc) {
     double prf[2];
     struct prm_handler m_prm = prm_open(args->m_prm);
     struct prm_handler s_prm = prm_open(args->s_prm);
+
+    require_prm_value(m_prm, "SLC_file", args->m_prm);
+    require_prm_value(m_prm, "num_rng_bins", args->m_prm);
+    require_prm_value(m_prm, "num_patches", args->m_prm);
+    require_prm_value(m_prm, "num_valid_az", args->m_prm);
+    require_prm_value(m_prm, "PRF", args->m_prm);
+
+    require_prm_value(s_prm, "SLC_file", args->s_prm);
+    require_prm_value(s_prm, "num_rng_bins", args->s_prm);
+    require_prm_value(s_prm, "num_patches", args->s_prm);
+    require_prm_value(s_prm, "num_valid_az", args->s_prm);
+    require_prm_value(s_prm, "PRF", args->s_prm);
+
+    if (!args->noshift) {
+        require_prm_value(s_prm, "rshift", args->s_prm);
+        require_prm_value(s_prm, "ashift", args->s_prm);
+    }
 
     xc->m_path = strdup(prm_get_str(m_prm, "SLC_file"));
     strtrim(xc->m_path);
@@ -70,6 +189,7 @@ void apply_args(const struct st_xcorr_args *args, struct st_xcorr *xc) {
         xc->interp_factor = args->interp ? args->interp : 16;
 
     xc->n2x = xc->n2y = 8;
+    validate_xcorr_config(xc);
 
     prm_close(&m_prm);
     prm_close(&s_prm);
@@ -101,8 +221,8 @@ void parse_opts(struct st_xcorr_args *xa, int argc, char **argv) {
         "-nointerp              do not interpolate correlation function\n"
         "-range_interp ri       interpolate range by ri (power of two) [default: 2]\n"
         "-norange               do not range interpolate \n"
-        "-xsearch xs            search window size in x (range) direction (int power of 2 [32 64 128 256])\n"
-        "-ysearch ys            search window size in y (azimuth) direction (int power of 2 [32 64 128 256])\n"
+        "-xsearch xs            search window size in x (range) direction (int power of 2 [32 64 128 256 512 1024 2048])\n"
+        "-ysearch ys            search window size in y (azimuth) direction (int power of 2 [32 64 128 256 512 1024 2048])\n"
         "-interp  factor        interpolate correlation function by factor (int) [default, 16]\n"
         "-af [cuda|opencl|cpu]  ArrayFire accelerate backend \n"
         "output: \n freq_xcorr.dat (default) \n time_xcorr.dat (if -time option))\n"
@@ -133,34 +253,30 @@ void parse_opts(struct st_xcorr_args *xa, int argc, char **argv) {
     memset(xa, 0, sizeof(struct st_xcorr_args));
 
     while (1) {
-        int opt, long_index, int_arg;
+        int opt, long_index = 0, int_arg;
         opt = getopt_long_only(argc, argv, "", long_options, &long_index);
 
         if (opt == -1) break;
 
-        if (opt > 0) {
-            char *endptr;
-            int_arg = strtol(optarg, &endptr, 10);
-            if (*endptr != '\0') {
-                fprintf(stderr, "Invalid argument for -%s option", long_options[long_index].name);
-                exit(-1);
-            }
-        }
-
         switch (opt) {
             case OPT_NX:
+                int_arg = parse_int_opt("nx", optarg);
                 xa->nx = int_arg;
                 break;
             case OPT_NY:
+                int_arg = parse_int_opt("ny", optarg);
                 xa->ny = int_arg;
                 break;
             case OPT_XSEARCH:
+                int_arg = parse_int_opt("xsearch", optarg);
                 xa->xsearch = int_arg;
                 break;
             case OPT_YSEARCH:
+                int_arg = parse_int_opt("ysearch", optarg);
                 xa->ysearch = int_arg;
                 break;
             case OPT_INTERP:
+                int_arg = parse_int_opt("interp", optarg);
                 xa->interp = int_arg;
                 break;
             case OPT_DEVICE:
@@ -176,6 +292,7 @@ void parse_opts(struct st_xcorr_args *xa, int argc, char **argv) {
                 }
                 break;
             case OPT_RANGE_INTERP:
+                int_arg = parse_int_opt("range_interp", optarg);
                 xa->range_interp = int_arg;
                 break;
             case OPT_NO_SHIFT:
@@ -190,8 +307,12 @@ void parse_opts(struct st_xcorr_args *xa, int argc, char **argv) {
             case OPT_HELP:
                 fputs(help, stdout);
                 exit(0);
+            case '?':
+                fputs(help, stderr);
+                exit(EXIT_FAILURE);
             default:
-                abort();
+                fputs(help, stderr);
+                exit(EXIT_FAILURE);
         }
     }
 

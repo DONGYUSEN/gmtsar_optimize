@@ -1,6 +1,7 @@
 #include "xcorr2.h"
 #include <assert.h>
 #include <string.h>
+#include <stdlib.h>
 #include <limits.h>
 #include <math.h>
 #include <fftw3.h>
@@ -23,6 +24,10 @@ complex double *c64_array_slice(
 
     complex double *arr;
     arr = fftw_alloc_complex(s_x * s_y);
+    if (arr == NULL) {
+        perror("Failed to allocate memory for complex slice");
+        exit(EXIT_FAILURE);
+    }
 
     for (int i=0; i<s_y; i++)
         memcpy(&arr[i*s_x], &mat[(i+tl_y)*n_cols + tl_x], s_x * sizeof(complex double));
@@ -39,6 +44,10 @@ double *f64_array_slice(
 
     double *arr;
     arr = fftw_alloc_real(s_x * s_y);
+    if (arr == NULL) {
+        perror("Failed to allocate memory for real slice");
+        exit(EXIT_FAILURE);
+    }
 
     for (int i=0; i<s_y; i++)
         memcpy(&arr[i*s_x], &mat[(i+tl_y)*n_cols + tl_x], s_x * sizeof(double));
